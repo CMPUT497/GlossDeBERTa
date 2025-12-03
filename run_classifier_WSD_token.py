@@ -1,6 +1,6 @@
 # coding=utf-8
 
-"""BERT finetuning runner."""
+"""GlossDeBERTa finetuning runner."""
 
 from __future__ import absolute_import, division, print_function
 
@@ -16,6 +16,7 @@ import pickle
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
@@ -24,11 +25,16 @@ from tqdm import tqdm, trange
 
 from torch.nn import CrossEntropyLoss, MSELoss
 
-from file_utils import PYTORCH_PRETRAINED_BERT_CACHE, WEIGHTS_NAME, CONFIG_NAME
-from modeling import BertForTokenClassification, BertConfig
-from tokenization import BertTokenizer
-from optimization import BertAdam, warmup_linear
-
+# Modern Transformers imports
+from torch.optim import AdamW 
+from transformers import (
+    AutoTokenizer, 
+    AutoConfig, 
+    get_linear_schedule_with_warmup,
+    DebertaV2Model,
+    DebertaV2PreTrainedModel
+)
+from transformers.modeling_outputs import SequenceClassifierOutput
 
 logger = logging.getLogger(__name__)
 
@@ -36,17 +42,6 @@ class InputExample(object):
     """A single training/test example for simple sequence classification."""
 
     def __init__(self, guid, text_a, start_id, end_id, text_b=None, label=None):
-        """Constructs a InputExample.
-
-        Args:
-            guid: Unique id for the example.
-            text_a: string. The untokenized text of the first sequence. For single
-            sequence tasks, only this sequence must be specified.
-            text_b: (Optional) string. The untokenized text of the second sequence.
-            Only must be specified for sequence pair tasks.
-            label: (Optional) string. The label of the example. This should be
-            specified for train and dev examples, but not for test examples.
-        """
         self.guid = guid
         self.text_a = text_a
         self.text_b = text_b
@@ -59,24 +54,19 @@ class DataProcessor(object):
     """Base class for data converters for sequence classification data sets."""
 
     def get_train_examples(self, data_dir, label_data_dir):
-        """Gets a collection of `InputExample`s for the train set."""
         raise NotImplementedError()
 
     def get_dev_examples(self, data_dir, label_data_dir):
-        """Gets a collection of `InputExample`s for the dev set."""
         raise NotImplementedError()
     
     def get_test_examples(self, data_dir, label_data_dir):
-        """Gets a collection of `InputExample`s for the test set."""
         raise NotImplementedError()
 
     def get_labels(self):
-        """Gets the list of labels for this data set."""
         raise NotImplementedError()
     
     @classmethod
     def _read_tsv(cls, input_file, quotechar=None):
-        """Reads a tab separated value file."""
         with open(input_file, "r") as f:
             reader = csv.reader(f, delimiter="\t", quotechar=quotechar)
             lines = []
@@ -88,54 +78,42 @@ class WSD_token_Processor(DataProcessor):
     """Processor for the WSD data set."""
 
     def get_train_examples(self, data_dir, label_data_dir):
-        """See base class."""
         train_data = pd.read_csv(data_dir, sep="\t", na_filter=False).values
         with open(os.path.join(label_data_dir,"lemma2index_dict.pkl"), 'rb') as p:
             lemma2index_dict = pickle.load(p)
         return self._create_examples(train_data, "train", lemma2index_dict)
 
     def get_dev_examples(self, data_dir, label_data_dir):
-        """See base class."""
         dev_data = pd.read_csv(data_dir, sep="\t", na_filter=False).values
         with open(os.path.join(label_data_dir,"lemma2index_dict.pkl"), 'rb') as p:
             lemma2index_dict = pickle.load(p)
         return self._create_examples(dev_data, "dev", lemma2index_dict)
 
     def get_labels(self):
-        """See base class."""
-
         return ["0", "1"]
 
     def _create_examples(self, lines, set_type, lemma2index_dict):
-        """Creates examples for the training and dev sets."""
         examples = []
-        # max_sen_length = 0
         for (i, line) in enumerate(lines):
-            # if set_type == 'train' and i >=1000: break
-            # if set_type == 'dev' and i>=10000: break
             guid = "%s-%s" % (set_type, i)
             text_a = str(line[2])
             text_b = str(line[3])
-            # length = len(text_a.split(' '))
-            # if length>max_sen_length: max_sen_length=length
             start_id = int(line[4])
             end_id = int(line[5])
             label = str(line[1])
 
-            if i%1000==0:
+            if i % 1000 == 0:
                 print(i)
-                print("guid=",guid)
-                print("text_a=",text_a)
-                print("text_b=",text_b)
-                print("start_id=",start_id)
-                print("end_id=",end_id)
-                print("label=",label)
+                print("guid=", guid)
+                print("text_a=", text_a)
+                print("text_b=", text_b)
+                print("start_id=", start_id)
+                print("end_id=", end_id)
+                print("label=", label)
 
             examples.append(
                 InputExample(guid=guid, text_a=text_a, start_id=start_id, end_id=end_id, 
                 text_b=text_b, label=label))
-        # print("max_length", max_sen_length)
-        # print(len(lines))
         return examples
 
 class InputFeatures(object):
@@ -150,7 +128,7 @@ class InputFeatures(object):
 
 def convert_examples_to_features(examples, label_list, max_seq_length,
                                  tokenizer, output_mode):
-    """Loads a data file into a list of `InputBatch`s."""
+    """Loads a data file into a list of `InputFeatures`."""
 
     label_map = {label : i for i, label in enumerate(label_list)}
 
@@ -159,54 +137,51 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
         if ex_index % 10000 == 0:
             logger.info("Writing example %d of %d" % (ex_index, len(examples)))
 
-        
         orig_tokens = example.text_a.split(' ')
         target_start = example.start_id
         target_end = example.end_id
         bert_tokens = []
 
-        bert_tokens.append("[CLS]")
+        # Start with CLS token
+        bert_tokens.append(tokenizer.cls_token)
+        
+        target_to_tok_map_start = 0
+        target_to_tok_map_end = 0
+
+        # We tokenize word by word to map the start_id/end_id correctly
         for length in range(len(orig_tokens)):
             if length == target_start:
                 target_to_tok_map_start = len(bert_tokens)
             if length == target_end:
                 target_to_tok_map_end = len(bert_tokens)
-                break
-            bert_tokens.extend(tokenizer.tokenize(orig_tokens[length]))
+            
+            sub_tokens = tokenizer.tokenize(orig_tokens[length])
+            if not sub_tokens:
+                sub_tokens = [tokenizer.unk_token]
+            bert_tokens.extend(sub_tokens)
+
         if target_end == len(orig_tokens):
             target_to_tok_map_end = len(bert_tokens)
-        # bert_tokens.append("[SEP]")
-        bert_tokens = tokenizer.tokenize(example.text_a)
 
-
-
+        # Use SEP token
+        bert_tokens.append(tokenizer.sep_token)
+        
         tokens_b = None
         if example.text_b:
             tokens_b = tokenizer.tokenize(example.text_b)
-            # Modifies `tokens_a` and `tokens_b` in place so that the total
-            # length is less than the specified length.
-            # Account for [CLS], [SEP], [SEP] with "- 3"
-            _truncate_seq_pair(bert_tokens, tokens_b, max_seq_length - 3)
+            # Account for [CLS], [SEP], [SEP]
+            _truncate_seq_pair(bert_tokens, tokens_b, max_seq_length - 1)
+            bert_tokens += tokens_b + [tokenizer.sep_token]
+            segment_ids = [0] * len(bert_tokens) # DeBERTa V3 typically uses type 0
         else:
-            # Account for [CLS] and [SEP] with "- 2"
-            if len(tokens_a) > max_seq_length - 2:
-                tokens_a = tokens_a[:(max_seq_length - 2)]
-
-        bert_tokens = ["[CLS]"] + bert_tokens + ["[SEP]"]
-        segment_ids = [0] * len(bert_tokens)
-
-        bert_tokens += tokens_b + ["[SEP]"]
-        segment_ids += [1] * (len(tokens_b) + 1)
-        
+            if len(bert_tokens) > max_seq_length:
+                bert_tokens = bert_tokens[:max_seq_length]
+            segment_ids = [0] * len(bert_tokens)
 
         input_ids = tokenizer.convert_tokens_to_ids(bert_tokens)
-
-        # The mask has 1 for real tokens and 0 for padding tokens. Only real
-        # tokens are attended to.
         input_mask = [1] * len(input_ids)
 
-
-        # Zero-pad up to the sequence length.
+        # Zero-pad
         padding = [0] * (max_seq_length - len(input_ids))
         input_ids += padding
         input_mask += padding
@@ -225,20 +200,20 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
 
         # The mask has 1 for real target
         target_mask = [0] * max_seq_length
-        for i in range(target_to_tok_map_start, target_to_tok_map_end):
-            target_mask[i] = 1
+        # Ensure indices are within bounds
+        real_start = target_to_tok_map_start
+        real_end = min(target_to_tok_map_end, max_seq_length)
         
-     
+        for i in range(real_start, real_end):
+            target_mask[i] = 1
         
         if ex_index < 5:
             logger.info("*** Example ***")
             logger.info("guid: %s" % (example.guid))
-            logger.info("tokens: %s" % " ".join(
-                    [str(x) for x in bert_tokens]))
+            logger.info("tokens: %s" % " ".join([str(x) for x in bert_tokens]))
             logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
             logger.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
-            logger.info(
-                    "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
+            logger.info("segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
             logger.info("label: %s (id = %d)" % (example.label, label_id))
             logger.info("target_mask: %s" % " ".join([str(x) for x in target_mask]))
 
@@ -253,16 +228,70 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
 
 def _truncate_seq_pair(tokens_a, tokens_b, max_length):
     """Truncates a sequence pair in place to the maximum length."""
-
-    # This is a simple heuristic which will always truncate the longer sequence
-    # one token at a time. This makes more sense than truncating an equal percent
-    # of tokens from each, since if one sequence is very short then each token
-    # that's truncated likely contains more information than a longer sequence.
     while True:
         total_length = len(tokens_a) + len(tokens_b)
         if total_length <= max_length:
             break
-        tokens_b.pop()
+        # Heuristic: Always pop from the longer sequence
+        if len(tokens_a) > len(tokens_b):
+            tokens_a.pop()
+        else:
+            tokens_b.pop()
+
+# --- Custom Model Class for DeBERTa WSD ---
+class DebertaForWSD(DebertaV2PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.deberta = DebertaV2Model(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        self.post_init()
+
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, 
+                labels=None, target_mask=None, **kwargs):
+        
+        outputs = self.deberta(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            **kwargs
+        )
+        
+        sequence_output = outputs[0]
+        sequence_output = self.dropout(sequence_output)
+        
+        # Custom Logic from GlossBERT: average target token embeddings
+        batch_size, seq_len, hidden_size = sequence_output.size()
+        
+        pooled_output_list = []
+        for i in range(batch_size):
+            # Extract the embeddings where target_mask is 1
+            mask = target_mask[i] == 1
+            if mask.sum() == 0:
+                # Fallback if mask is empty (shouldn't happen if data is correct)
+                # Just take CLS or first token
+                target_emb = sequence_output[i, 0, :].unsqueeze(0) 
+            else:
+                target_emb = sequence_output[i][mask] # [num_target_tokens, hidden]
+                target_emb = torch.mean(target_emb, dim=0, keepdim=True) # [1, hidden]
+            
+            pooled_output_list.append(target_emb)
+            
+        pooled_output = torch.cat(pooled_output_list, dim=0) # [batch, hidden]
+        logits = self.classifier(pooled_output)
+
+        loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
 
 def main():
@@ -277,11 +306,11 @@ def main():
     parser.add_argument("--train_data_dir",
                         default=None,
                         type=str,
-                        help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
+                        help="The input data dir. Should contain the .tsv files.")
     parser.add_argument("--eval_data_dir",
                         default=None,
                         type=str,
-                        help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
+                        help="The input data dir. Should contain the .tsv files.")
     parser.add_argument("--label_data_dir",
                         default=None,
                         type=str,
@@ -291,17 +320,13 @@ def main():
                         default=None,
                         type=str,
                         required=True,
-                        help="The output directory where the model checkpoints will be written.")
-    parser.add_argument("--bert_model", default=None, type=str, required=True,
-                        help='''a path or url to a pretrained model archive containing:
-                        'bert_config.json' a configuration file for the model
-                        'pytorch_model.bin' a PyTorch dump of a BertForPreTraining instance''')
+                        help="The output directory.")
+    parser.add_argument("--bert_model", 
+                        default="microsoft/deberta-v3-base", 
+                        type=str, 
+                        help="Path to pre-trained model or shortcut name.")
     
     ## Other parameters
-    parser.add_argument("--cache_dir",
-                        default="",
-                        type=str,
-                        help="Where do you want to store the pre-trained models downloaded from s3")
     parser.add_argument("--do_train",
                         action='store_true',
                         help="Whether to run training.")
@@ -311,16 +336,10 @@ def main():
     parser.add_argument("--do_test",
                         action='store_true',
                         help="Whether to run test on the test set.")            
-    parser.add_argument("--do_lower_case",
-                        default=False,
-                        action='store_true',
-                        help="Whether to lower case the input text. True for uncased models, False for cased models.")
     parser.add_argument("--max_seq_length",
                         default=128,
                         type=int,
-                        help="The maximum total input sequence length after WordPiece tokenization. \n"
-                             "Sequences longer than this will be truncated, and sequences shorter \n"
-                             "than this will be padded.")
+                        help="The maximum total input sequence length after tokenization.")
     parser.add_argument("--train_batch_size",
                         default=32,
                         type=int,
@@ -330,7 +349,7 @@ def main():
                         type=int,
                         help="Total batch size for eval.")
     parser.add_argument("--learning_rate",
-                        default=5e-5,
+                        default=2e-5,
                         type=float,
                         help="The initial learning rate for Adam.")
     parser.add_argument("--num_train_epochs",
@@ -340,8 +359,7 @@ def main():
     parser.add_argument("--warmup_proportion",
                         default=0.1,
                         type=float,
-                        help="Proportion of training to perform linear learning rate warmup for. "
-                             "E.g., 0.1 = 10%% of training.")
+                        help="Proportion of training to perform linear learning rate warmup for.")
     parser.add_argument("--no_cuda",
                         default=False,
                         action='store_true',
@@ -357,15 +375,14 @@ def main():
     parser.add_argument('--gradient_accumulation_steps',
                         type=int,
                         default=1,
-                        help="Number of updates steps to accumualte before performing a backward/update pass.")                       
-    parser.add_argument('--fp16',
-                        action='store_true',
-                        help="Whether to use 16-bit float precision instead of 32-bit")
-    parser.add_argument('--loss_scale',
-                        type=float, default=0,
-                        help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
-                             "0 (default value): dynamic loss scaling.\n"
-                             "Positive power of 2: static loss scaling value.\n")
+                        help="Number of updates steps to accumulate before performing a backward/update pass.")  
+    
+    # NEW PARAMETER FOR TRUNCATION
+    parser.add_argument("--num_layers",
+                        default=None,
+                        type=int,
+                        help="Number of hidden layers to use (e.g., 7). If None, uses full model.")
+    
     args = parser.parse_args()
 
     if args.local_rank == -1 or args.no_cuda:
@@ -375,20 +392,14 @@ def main():
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
         n_gpu = 1
-        # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.distributed.init_process_group(backend='nccl')
-
 
     logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                         datefmt = '%m/%d/%Y %H:%M:%S',
                         level = logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
 
-    logger.info("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
-        device, n_gpu, bool(args.local_rank != -1), args.fp16))
-
-    if args.gradient_accumulation_steps < 1:
-        raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
-                            args.gradient_accumulation_steps))
+    logger.info("device: {} n_gpu: {}, distributed training: {}".format(
+        device, n_gpu, bool(args.local_rank != -1)))
 
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
@@ -401,17 +412,16 @@ def main():
     if not args.do_train and not args.do_test:
         raise ValueError("At least one of `do_train` or `do_test` must be True.")
     if args.do_train:
-        assert args.train_data_dir != None, "train_data_dir can not be None"
+        assert args.train_data_dir is not None, "train_data_dir can not be None"
     if args.do_eval:
-        assert args.eval_data_dir != None, "eval_data_dir can not be None"
+        assert args.eval_data_dir is not None, "eval_data_dir can not be None"
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train:
         raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # prepare dataloaders
     processors = {
-        "WSD":WSD_token_Processor
+        "WSD": WSD_token_Processor
     }
 
     output_modes = {
@@ -423,9 +433,10 @@ def main():
     label_list = processor.get_labels()
     num_labels = len(label_list)
 
-    tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+    # Use AutoTokenizer for DeBERTa compatibility
+    tokenizer = AutoTokenizer.from_pretrained(args.bert_model, use_fast=False)
 
-    # training set
+    # Training set
     train_examples = None
     num_train_optimization_steps = None
     if args.do_train:
@@ -435,60 +446,49 @@ def main():
         if args.local_rank != -1:
             num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
 
-
     # Prepare model
-    cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed_{}'.format(args.local_rank))
-    model = BertForTokenClassification.from_pretrained(args.bert_model,
-              cache_dir=cache_dir,
-              num_labels=num_labels)
- 
-    if args.fp16:
-        model.half()
+    logger.info(f"Loading model: {args.bert_model}")
+    model = DebertaForWSD.from_pretrained(
+        args.bert_model,
+        num_labels=num_labels,
+        ignore_mismatched_sizes=True
+    )
+    
+    # --- TRUNCATION LOGIC ---
+    if args.num_layers is not None:
+        logger.info(f"Truncating model to first {args.num_layers} layers.")
+        # Slice the ModuleList to keep only the first N layers
+        model.deberta.encoder.layer = nn.ModuleList(model.deberta.encoder.layer[:args.num_layers])
+        model.config.num_hidden_layers = args.num_layers
+    # ------------------------
+    
     model.to(device)
 
     if args.local_rank != -1:
-        try:
-            from apex.parallel import DistributedDataParallel as DDP
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
-
-        model = DDP(model)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank)
     elif n_gpu > 1:
         model = torch.nn.DataParallel(model)
 
+    # Prepare optimizer and scheduler
+    optimizer = None
+    scheduler = None
     
-    # Prepare optimizer
-    param_optimizer = list(model.named_parameters())
-    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
-        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-        ]
-    if args.fp16:
-        try:
-            from apex.optimizers import FP16_Optimizer
-            from apex.optimizers import FusedAdam
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
+    if args.do_train:
+        param_optimizer = list(model.named_parameters())
+        no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+            {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+            ]
+        
+        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, 
+            num_warmup_steps=int(num_train_optimization_steps * args.warmup_proportion), 
+            num_training_steps=num_train_optimization_steps
+        )
 
-        optimizer = FusedAdam(optimizer_grouped_parameters,
-                              lr=args.learning_rate,
-                              bias_correction=False,
-                              max_grad_norm=1.0)
-        if args.loss_scale == 0:
-            optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
-        else:
-            optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
-
-    else:
-        optimizer = BertAdam(optimizer_grouped_parameters,
-                             lr=args.learning_rate,
-                             warmup=args.warmup_proportion,
-                             t_total=num_train_optimization_steps)
-
-
-
-    # load data
+    # Load data
     if args.do_train:
         train_features = convert_examples_to_features(
             train_examples, label_list, args.max_seq_length, tokenizer, output_mode)
@@ -513,7 +513,6 @@ def main():
             train_sampler = DistributedSampler(train_data)
         train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
 
-
     if args.do_eval:
         eval_examples = processor.get_dev_examples(args.eval_data_dir, args.label_data_dir)
         eval_features = convert_examples_to_features(
@@ -534,10 +533,7 @@ def main():
         eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_target_mask)
         eval_dataloader = DataLoader(eval_data, batch_size=args.eval_batch_size, shuffle=False)
 
-
-
-
-    # train
+    # Train
     global_step = 0
     nb_tr_steps = 0
     tr_loss = 0
@@ -553,55 +549,39 @@ def main():
                 batch = tuple(t.to(device) for t in batch)
                 input_ids, input_mask, segment_ids, label_ids, target_mask = batch
 
-                logits = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, labels=None, target_mask=target_mask)
-
-                if output_mode == "classification":
-                    loss_fct = CrossEntropyLoss()
-                    loss = loss_fct(logits.view(-1, num_labels), label_ids.view(-1))
-                elif output_mode == "regression":
-                    loss_fct = MSELoss()
-                    loss = loss_fct(logits.view(-1), label_ids.view(-1))
+                outputs = model(
+                    input_ids=input_ids, 
+                    token_type_ids=segment_ids, 
+                    attention_mask=input_mask, 
+                    labels=label_ids, 
+                    target_mask=target_mask
+                )
+                loss = outputs.loss
 
                 if n_gpu > 1:
-                    loss = loss.mean() # mean() to average on multi-gpu.
+                    loss = loss.mean()
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
 
-                if args.fp16:
-                    optimizer.backward(loss)
-                else:
-                    loss.backward()
+                loss.backward()
 
                 tr_loss += loss.item()
                 nb_tr_examples += input_ids.size(0)
                 nb_tr_steps += 1
                 if (step + 1) % args.gradient_accumulation_steps == 0:
-                    if args.fp16:
-                        # modify learning rate with special warm up BERT uses
-                        # if args.fp16 is False, BertAdam is used that handles this automatically
-                        lr_this_step = args.learning_rate * warmup_linear(global_step/num_train_optimization_steps, args.warmup_proportion)
-                        for param_group in optimizer.param_groups:
-                            param_group['lr'] = lr_this_step
                     optimizer.step()
+                    scheduler.step()
                     optimizer.zero_grad()
                     global_step += 1
                 
-
             # Save a trained model, configuration and tokenizer
-            model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
-
-            # If we save using the predefined names, we can load using `from_pretrained`
+            model_to_save = model.module if hasattr(model, 'module') else model
             model_output_dir = os.path.join(args.output_dir, str(epoch))
             if not os.path.exists(model_output_dir):
                 os.makedirs(model_output_dir)
-            output_model_file = os.path.join(model_output_dir, WEIGHTS_NAME)
-            output_config_file = os.path.join(model_output_dir, CONFIG_NAME)
-
-            torch.save(model_to_save.state_dict(), output_model_file)
-            model_to_save.config.to_json_file(output_config_file)
-            tokenizer.save_vocabulary(model_output_dir)
-
-
+            
+            model_to_save.save_pretrained(model_output_dir)
+            tokenizer.save_pretrained(model_output_dir)
 
             if args.do_eval:
                 model.eval()
@@ -617,20 +597,28 @@ def main():
                         target_mask = target_mask.to(device)
 
                         with torch.no_grad():
-                            logits = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, labels=None, target_mask=target_mask)
-
+                            outputs = model(
+                                input_ids=input_ids, 
+                                token_type_ids=segment_ids, 
+                                attention_mask=input_mask, 
+                                labels=label_ids,
+                                target_mask=target_mask
+                            )
+                        
+                        logits = outputs.logits
                         logits_ = F.softmax(logits, dim=-1)
                         logits_ = logits_.detach().cpu().numpy()
                         label_ids_ = label_ids.to('cpu').numpy()
-                        outputs = np.argmax(logits_, axis=1)
-                        for output_i in range(len(outputs)):
-                            f.write(str(outputs[output_i]))
+                        outputs_idx = np.argmax(logits_, axis=1)
+                        
+                        for output_i in range(len(outputs_idx)):
+                            f.write(str(outputs_idx[output_i]))
                             for ou in logits_[output_i]:
                                 f.write(" " + str(ou))
                             f.write("\n")
-                        tmp_eval_accuracy = np.sum(outputs == label_ids_)
-
-                        # create eval loss and other metric required by the task
+                        
+                        tmp_eval_accuracy = np.sum(outputs_idx == label_ids_)
+                        
                         if output_mode == "classification":
                             loss_fct = CrossEntropyLoss()
                             tmp_eval_loss = loss_fct(logits.view(-1, num_labels), label_ids.view(-1))
@@ -660,8 +648,9 @@ def main():
                     for key in result.keys():
                         logger.info("  %s = %s", key, str(result[key]))
                         writer.write("%s = %s\n" % (key, str(result[key])))
-
-
+                
+                # Set back to train mode
+                model.train()
 
     if args.do_test and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
         eval_examples = processor.get_dev_examples(args.eval_data_dir, args.label_data_dir)
@@ -683,7 +672,6 @@ def main():
         eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_target_mask)
         eval_dataloader = DataLoader(eval_data, batch_size=args.eval_batch_size, shuffle=False)
 
-
         model.eval()
         eval_loss, eval_accuracy = 0, 0
         nb_eval_steps, nb_eval_examples = 0, 0
@@ -697,20 +685,26 @@ def main():
                 target_mask = target_mask.to(device)
 
                 with torch.no_grad():
-                    logits = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, labels=None, target_mask=target_mask)
+                    outputs = model(
+                        input_ids=input_ids, 
+                        token_type_ids=segment_ids, 
+                        attention_mask=input_mask, 
+                        labels=label_ids,
+                        target_mask=target_mask
+                    )
 
+                logits = outputs.logits
                 logits_ = F.softmax(logits, dim=-1)
                 logits_ = logits_.detach().cpu().numpy()
                 label_ids_ = label_ids.to('cpu').numpy()
-                outputs = np.argmax(logits_, axis=1)
-                for output_i in range(len(outputs)):
-                    f.write(str(outputs[output_i]))
+                outputs_idx = np.argmax(logits_, axis=1)
+                for output_i in range(len(outputs_idx)):
+                    f.write(str(outputs_idx[output_i]))
                     for ou in logits_[output_i]:
                         f.write(" " + str(ou))
                     f.write("\n")
-                tmp_eval_accuracy = np.sum(outputs == label_ids_)
+                tmp_eval_accuracy = np.sum(outputs_idx == label_ids_)
 
-                # create eval loss and other metric required by the task
                 if output_mode == "classification":
                     loss_fct = CrossEntropyLoss()
                     tmp_eval_loss = loss_fct(logits.view(-1, num_labels), label_ids.view(-1))
