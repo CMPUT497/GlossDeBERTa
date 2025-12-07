@@ -5,6 +5,7 @@ from transformers import AutoTokenizer, DebertaV2PreTrainedModel, DebertaV2Model
 import json
 import os
 
+# --- 1. MODEL DEFINITION ---
 class DebertaForWSD(DebertaV2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -35,17 +36,22 @@ class DebertaForWSD(DebertaV2PreTrainedModel):
         logits = self.classifier(pooled_output)
         return logits
 
+# --- 2. SCORING FUNCTION ---
 def predict_item(model, tokenizer, item, device):
+    # Construct Context
     parts = [
         item.get('precontext', ''),
         item.get('sentence', ''),
         item.get('ending', '')
     ]
-    # Filter out empty strings and join with space
     context = " ".join([p for p in parts if p]).strip()
     
-    target_word = item['homonym']
-    gloss = item['judged_meaning']
+    target_word = item.get('homonym')
+    gloss = item.get('judged_meaning') # Ensure this key matches your JSON
+
+    if not target_word or not gloss:
+        # Skip invalid items
+        return 1
 
     # Tokenize
     inputs = tokenizer(
@@ -61,11 +67,12 @@ def predict_item(model, tokenizer, item, device):
     attention_mask = inputs["attention_mask"].to(device)
     token_type_ids = inputs.get("token_type_ids", torch.zeros_like(input_ids)).to(device)
 
+    # Find Target Mask
     target_mask = torch.zeros_like(input_ids)
     sep_pos = (input_ids[0] == tokenizer.sep_token_id).nonzero(as_tuple=True)[0][0].item()
     
     target_subtokens = tokenizer(" " + target_word, add_special_tokens=False)['input_ids']
-    if not target_subtokens: # fallback
+    if not target_subtokens:
         target_subtokens = tokenizer(target_word, add_special_tokens=False)['input_ids']
 
     found = False
@@ -75,6 +82,7 @@ def predict_item(model, tokenizer, item, device):
             found = True
             break
     
+    # Inference
     model.eval()
     with torch.no_grad():
         logits = model(
@@ -84,15 +92,41 @@ def predict_item(model, tokenizer, item, device):
             target_mask=target_mask
         )
         probs = F.softmax(logits, dim=1)
-        raw_prob = probs[0][1].item() # Probability of "Yes"
+        raw_prob = probs[0][1].item()
 
     score = round(raw_prob * 5)
-    
     if score < 1: score = 1
     if score > 5: score = 5
     
     return int(score)
 
+# --- 3. HELPER: ROBUST DATA LOADING ---
+def load_data(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read().strip()
+        
+    try:
+        # Try loading as standard JSON list
+        data = json.loads(content)
+        # Handle dictionary of items (like your dev.json snippet)
+        if isinstance(data, dict):
+            # Convert dict {"0": {...}, "1": {...}} to list [{...}, {...}]
+            return [data[key] for key in sorted(data.keys(), key=lambda x: int(x) if x.isdigit() else x)]
+        return data
+    except json.JSONDecodeError:
+        # Fallback: Try loading as JSON Lines (NDJSON)
+        data = []
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        data.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        print(f"Skipping invalid line: {line[:50]}...")
+        return data
+
+# --- 4. MAIN EXECUTION ---
 if __name__ == "__main__":
     MODEL_PATH = "./results/gloss_deberta_full_7layers/results/merged_model"
     INPUT_FILE = "./data/dev.json"
@@ -106,27 +140,30 @@ if __name__ == "__main__":
     model.to(device)
 
     print(f"Reading data from {INPUT_FILE}...")
-    with open(INPUT_FILE, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
+    data = load_data(INPUT_FILE)
+    
+    # Validation check
+    if isinstance(data, list) and len(data) > 0:
+        if isinstance(data[0], str):
+            print("Error: Data loaded as a list of strings. Parsing strings to JSON...")
+            try:
+                data = [json.loads(s) for s in data]
+            except:
+                print("Failed to parse strings. Check input file format.")
+    
     print(f"Generating predictions for {len(data)} items...")
     
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as out_f:
         for idx, item in enumerate(data):
-            
-            # Predict
-            final_score = predict_item(model, tokenizer, item, device)
-            
-            # Create output object
-            output_obj = {
-                "id": str(idx),
-                "prediction": final_score
-            }
-            
-            out_f.write(json.dumps(output_obj) + "\n")
-            
-            # Progress log (every 10 items)
-            if idx % 10 == 0:
-                print(f"Processed {idx}/{len(data)}: {output_obj}")
+            try:
+                final_score = predict_item(model, tokenizer, item, device)
+                output_obj = {"id": str(idx), "prediction": final_score}
+                out_f.write(json.dumps(output_obj) + "\n")
+                if idx % 50 == 0:
+                    print(f"Processed {idx}/{len(data)}")
+            except Exception as e:
+                print(f"Error processing item {idx}: {e}")
+                # Write a default score so line numbers align
+                out_f.write(json.dumps({"id": str(idx), "prediction": 1}) + "\n")
 
     print(f"\nDone! Results saved to {OUTPUT_FILE}")
