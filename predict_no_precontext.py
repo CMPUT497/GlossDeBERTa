@@ -38,7 +38,6 @@ class DebertaForWSD(DebertaV2PreTrainedModel):
 def predict_item(model, tokenizer, item, device):
     # Construct Context
     parts = [
-        item.get('precontext', ''),
         item.get('sentence', ''),
         item.get('ending', '')
     ]
@@ -122,7 +121,7 @@ def load_data(file_path):
 if __name__ == "__main__":
     MODEL_PATH = "./results/gloss_deberta_full_7layers/results/merged_model"
     INPUT_FILE = "./data/dev.json"
-    OUTPUT_FILE = "predictions.jsonl"
+    OUTPUT_FILE = "predictions_no_precontext.jsonl"
 
     print(f"Loading model from {MODEL_PATH}...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
