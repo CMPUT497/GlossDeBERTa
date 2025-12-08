@@ -96,7 +96,8 @@ def predict_item(model, tokenizer, item, device):
     if score < 1: score = 1
     if score > 5: score = 5
     
-    return int(score)
+    # return int(score)
+    return raw_prob
 
 def load_data(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
