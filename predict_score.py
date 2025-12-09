@@ -93,7 +93,7 @@ def predict_item(model, tokenizer, item, device):
         raw_prob = probs[0][1].item()
 
     # score = round(raw_prob * 5)
-    if raw_prob < 0.019188896: score = 2
+    if raw_prob < 0.0191888959936534: score = 2
     elif raw_prob < 0.304312307: score = 3
     elif raw_prob < 0.996154601: score = 4
     else: score = 5
