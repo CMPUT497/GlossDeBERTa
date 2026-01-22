@@ -124,7 +124,8 @@ def load_data(file_path):
 
 if __name__ == "__main__":
     MODEL_PATH = "/home/chirooth/experiments/GlossDeBERTa/results/gloss_deberta_full_7layers/results/merged_model"
-    INPUT_FILE = "./data/dev.json"
+    # INPUT_FILE = "./data/dev.json"
+    INPUT_FILE = "./data/test.json"
     OUTPUT_FILE = "predictions.jsonl"
 
     print(f"Loading model from {MODEL_PATH}...")
